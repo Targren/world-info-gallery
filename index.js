@@ -26,6 +26,102 @@ const UNSORTED = '__unsorted__';
 const RESERVED = new Set(['__uncategorized__', 'uncategorized', UNSORTED]);
 
 const ctx = SillyTavern.getContext();
+// Chat state on the cached ctx is an import-time snapshot: chatId and
+// characterId are plain values captured before any chat loads (so chat menu
+// items read "no chat" and stay disabled forever), and chatMetadata is a
+// dead reference — script.js REASSIGNS it on every chat switch (the ST
+// extension docs warn about exactly this). getContext() builds a fresh
+// object per call and is cheap; use it wherever current chat state matters.
+const ctxNow = () => SillyTavern.getContext();
+function chatOpen() {
+    const c = ctxNow();
+    return typeof c.getCurrentChatId === 'function' ? Boolean(c.getCurrentChatId()) : Boolean(c.chatId);
+}
+// ---- remembered chat bindings -------------------------------------------
+// A chat's lorebook binding lives inside that chat's file (chat_metadata),
+// which the client only holds for the currently open chat. To keep the chat
+// badge after switching away, we remember every binding we observe, keyed by
+// (owner, chatFile). Reconciled whenever a chat is opened: the live chat is
+// truth — its descriptor is removed from every book, then re-registered
+// under whatever its metadata names (if anything). A full scan (below) is
+// authoritative and clears entries the incremental path could never see.
+
+function chatOwnerKey() {
+    const c = ctxNow();
+    if (c.groupId) return `group:${c.groupId}`;
+    return c.characters?.[c.characterId]?.avatar ?? null;
+}
+
+function noteChatBindings() {
+    const c = ctxNow();
+    const owner = chatOwnerKey();
+    const file = String(c.chatId ?? '').replace(/\.jsonl$/, '');
+    if (!owner || !file) return; // no live chat
+    const s = getSettings();
+    const book = c.chatMetadata?.world_info || null;
+    const sameChat = (x) => x.o === owner && x.f === file;
+    let dirty = false;
+    for (const [name, arr] of Object.entries(s.chatBindings)) {
+        if (!Array.isArray(arr)) continue;
+        const kept = arr.filter((x) => !sameChat(x));
+        if (kept.length !== arr.length) {
+            if (kept.length) s.chatBindings[name] = kept;
+            else delete s.chatBindings[name];
+            dirty = true;
+        }
+    }
+    if (book) {
+        const arr = s.chatBindings[book] ??= [];
+        if (!arr.some(sameChat)) { arr.push({ o: owner, f: file }); dirty = true; }
+    }
+    if (dirty) saveSettings();
+}
+
+const rememberedChatLinks = (name) => getSettings().chatBindings[name] ?? [];
+
+function forgetChatBindings(name) {
+    const n = rememberedChatLinks(name).length;
+    delete getSettings().chatBindings[name];
+    saveSettings();
+    noteChatBindings(); // a live current-chat link immediately re-registers
+    refreshPopupBindingUi(name);
+    toast('info', `Forgot ${n} remembered chat link${n === 1 ? '' : 's'}.`);
+}
+
+// One request: /api/chats/recent { metadata: true } returns every chat file
+// (all characters, groups, root) with its chat_metadata — the whole
+// library's binding map in a single round trip. Verified against
+// src/endpoints/chats.js: items carry { avatar } or { group }, file_id
+// (extensionless), and chat_metadata.
+async function scanAllChatBindings() {
+    const res = await fetch('/api/chats/recent', {
+        method: 'POST',
+        headers: ctx.getRequestHeaders(),
+        body: JSON.stringify({ metadata: true }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const chats = await res.json();
+    if (!Array.isArray(chats)) throw new Error('Unexpected response');
+
+    const registry = {};
+    for (const c of chats) {
+        const book = c?.chat_metadata?.world_info;
+        if (!book) continue;
+        const owner = c.avatar ?? (c.group ? `group:${c.group}` : 'root');
+        const file = String(c.file_id ?? String(c.file_name ?? '').replace(/\.jsonl$/, ''));
+        if (!file) continue;
+        (registry[book] ??= []).push({ o: owner, f: file });
+    }
+
+    const s = getSettings();
+    s.chatBindings = registry; // full scan is authoritative — stale entries go
+    s.lastChatScan = Date.now();
+    saveSettings();
+    noteChatBindings(); // merge the live (possibly unsaved) current chat back in
+    renderGallery();
+    if (state.bp) renderPopupHead();
+    return { chats: chats.length, books: Object.keys(registry).length };
+}
 // POPUP_TYPE enum is a separate context export (Popup.Types does not exist)
 const POPUP_TEXT = ctx.POPUP_TYPE?.TEXT ?? 1;
 const ET = ctx.eventTypes ?? {};
@@ -40,10 +136,14 @@ const DEFAULTS = Object.freeze({
     collapsedFolders: {},  // worldName -> { folderName: true }
     lmImported: {},        // worldName -> true (auto Lorebook Manager import done)
 	placeholderCover: 'letter',  // no-image covers: 'letter' | 'initials' | 'icon'
+    lmImported: {},        // worldName -> true (auto Lorebook Manager import done)
+    chatBindings: {},      // worldName -> [{ o: ownerKey, f: chatFile }] remembered chat links
+    lastChatScan: 0,       // timestamp of the last "Scan all chats" run
 });
 
 const FILTERS = [
     ['all', 'All', 'fa-layer-group'],
+    ['current', 'Current', 'fa-bolt'],
     ['persona', 'Persona', 'fa-user'],
     ['character', 'Character', 'fa-user-astronaut'],
     ['chat', 'Chat', 'fa-comments'],
@@ -88,7 +188,7 @@ const tokenLabel = (n, estimated) => `${estimated ? '~' : ''}${fmtTokens(n ?? 0)
 // to (API, tokenizer setting, model). Any change forces a recount on next use.
 function tokenizerKey() {
     try {
-        return [ctx.mainApi, ctx.powerUserSettings?.tokenizer, ctx.chatCompletionSettings?.model].join('|');
+        return [ctxNow().mainApi, ctx.powerUserSettings?.tokenizer, ctx.chatCompletionSettings?.model].join('|');
     } catch {
         return 'unknown';
     }
@@ -241,11 +341,72 @@ function orderedFolders(book, folderNames) {
 }
 
 // ---------------------------------------------------------- binding model
-function wiSettings() { return ctx.worldInfoSettings ?? {}; }
+// ST moved World Info settings inside the world-info.js module and REMOVED
+// ctx.worldInfoSettings from the extension context. The module exports
+// `world_info` (the settings object: charLore, globalSelect, …) and
+// `selected_world_info` (the globally active books, read at prompt time) as
+// LIVE ES-module bindings — a cached namespace import gives always-current
+// synchronous access. updateWorldInfoSettings(settings, activeWorldInfo) is
+// the canonical global-active write.
+let wiModule; // undefined = unresolved, null = import failed
+async function loadWiModule() {
+    if (wiModule === undefined) {
+        try { wiModule = await import('../../../world-info.js'); }
+        catch { wiModule = null; }
+    }
+    return wiModule;
+}
+function wiLive() {
+    return wiModule?.world_info ?? ctx.worldInfoSettings ?? null;
+}
 
+// Treat the returned array as read-only (it may be the live module array)
 function globalActiveList() {
+    if (Array.isArray(wiModule?.selected_world_info)) return wiModule.selected_world_info;
+    const wiObj = wiLive();
+    if (Array.isArray(wiObj?.globalSelect)) return wiObj.globalSelect;
     const v = jq('#world_info').val();
-    return Array.isArray(v) ? v : (wiSettings().globalSelect ?? []);
+    return Array.isArray(v) ? v : [];
+}
+
+// Canonical global-active write. ST's `#world_info` change handler re-derives
+// the active list from the select2-backed DOM — and when our synthetic jQuery
+// `change` event reaches it, the value it reads back doesn't match what we
+// set (select2's data layer knows nothing about programmatic changes), so it
+// CLOBBERS the state the API call below just wrote — dropping the toggled
+// book and displacing previously active ones. So: write state via the
+// official API (ST PR #4921 added it for exactly this), sync the UI with the
+// select2-namespaced event only, then re-assert the authoritative state.
+async function setGlobalActiveList(list) {
+    const wi = await loadWiModule();
+    const apply = () => {
+        if (typeof wi?.updateWorldInfoSettings === 'function' && typeof wi?.getWorldInfoSettings === 'function') {
+            wi.updateWorldInfoSettings(wi.getWorldInfoSettings(), list);
+        } else {
+            // Legacy builds: mutate the settings object directly
+            const wiObj = wiLive();
+            if (wiObj) { wiObj.globalSelect = list; saveSettings(); }
+        }
+    };
+    apply();
+
+    const sel = jq('#world_info');
+    if (sel.length) {
+        for (const n of list) {
+            if (![...sel[0].options].some((o) => o.value === n)) sel.append(new Option(n, n));
+        }
+        sel.val(list);
+        // `change.select2` re-renders select2's tags but does NOT invoke
+        // handlers bound to bare `change` — ST's own handler stays out of it.
+        sel.trigger('change.select2');
+    }
+
+    // Re-assert: guarantee the authoritative state survived the UI sync
+    if (Array.isArray(wiModule?.selected_world_info)
+        && wiModule.selected_world_info.join('\u0000') !== list.join('\u0000')) {
+        console.warn(`[${MODULE_NAME}] Global active list diverged during UI sync — re-applying`);
+        apply();
+    }
 }
 
 function findPersonaByBook(name) {
@@ -260,7 +421,7 @@ function primaryCharFor(name) {
 }
 
 function extraCharsFor(name) {
-    return (wiSettings().charLore ?? [])
+    return (wiLive()?.charLore ?? [])
         .filter((e) => Array.isArray(e?.extraBooks) && e.extraBooks.includes(name))
         .map((e) => e.name);
 }
@@ -277,7 +438,31 @@ function computeBindings(name) {
     }
     if (!out.has('character') && extraCharsFor(name).length) out.add('character');
     if (ctx.chatMetadata?.world_info === name) out.add('chat'); // current chat only
+    // Chat binding: live (current chat) OR remembered from any other chat
+    if (ctxNow().chatMetadata?.world_info === name || rememberedChatLinks(name).length) out.add('chat');
     return out;
+
+}
+
+// "Currently active" = would inject into the prompt right now: Global
+// selection, the ACTIVE persona's lorebook (powerUserSettings.
+// persona_description_lorebook — ST maintains it on persona switches; it is
+// the same field ST's own /getpersona-book slash command reads), the current
+// character's primary or additional lorebooks, or the current chat's live
+// binding. Remembered links to OTHER chats don't count (they're not active).
+function isCurrentlyActive(name, bindings) {
+    if (bindings?.has('global')) return true;
+    const c = ctxNow();
+    const pu = ctx.powerUserSettings ?? {};
+    if (pu.persona_description_lorebook === name) return true;
+    const ch = c.characters?.[c.characterId];
+    if (ch) {
+        if (ch.data?.extensions?.world === name) return true;
+        const key = String(ch.avatar).replace(/\.[^.]+$/, '');
+        if ((wiLive()?.charLore ?? []).some((e) => e.name === key && e.extraBooks?.includes(name))) return true;
+    }
+    if (c.chatMetadata?.world_info === name) return true;
+    return false;
 }
 
 const manualType = (name) => getSettings().types[name] ?? null;
@@ -395,12 +580,32 @@ function coverFor(name, bindings) {
     if (!s.deriveCovers) return null;
     try {
         if (bindings.has('character')) {
-            const ch = primaryCharFor(name);
-            if (ch?.avatar) return { url: safeThumb('avatar', ch.avatar) };
+            const primary = primaryCharFor(name);
+            if (primary?.avatar) return { url: safeThumb('avatar', primary.avatar) };
+            // Auxiliary-only book: derive from a character that links it
+            const key = extraCharsFor(name)[0];
+            const extra = key && (ctx.characters ?? []).find(
+                (c) => String(c.avatar ?? '').replace(/\.[^.]+$/, '') === key);
+            if (extra?.avatar) return { url: safeThumb('avatar', extra.avatar) };
         }
         if (bindings.has('persona')) {
             const id = findPersonaByBook(name);
             if (id) return { url: safeThumb('persona', id) };
+        }
+        // Chat-bound book: derive from the character that OWNS the binding
+        // chat — the remembered link's owner — not the current chat's
+        // character, so the cover stays stable when chats are switched or
+        // closed. Live binding → current chat's owner; otherwise the first
+        // remembered link. Group-owned chats have no single character and
+        // fall through to the placeholder.
+        if (bindings.has('chat')) {
+            const live = ctxNow();
+            const boundHere = live.chatMetadata?.world_info === name;
+            const owner = boundHere ? chatOwnerKey() : rememberedChatLinks(name)[0]?.o;
+            const ch = owner && !String(owner).startsWith('group:')
+                ? (ctx.characters ?? []).find((c) => c.avatar === owner)
+                : null;
+            if (ch?.avatar) return { url: safeThumb('avatar', ch.avatar) };
         }
     } catch { /* fall through */ }
     return null;
@@ -472,7 +677,9 @@ async function openBook(name) {
     const names = await ctx.getWorldInfoNames();
     const idx = names.indexOf(name);
     if (idx === -1) { toast('warning', `Lorebook "${name}" no longer exists.`); return; }
-    jq('#world_editor_select').val(String(idx)).trigger('change');
+    jq('#world_editor_select').val(String(idx));
+    setView('editor'); // explicit — the synthetic change below no longer flips views
+    jq('#world_editor_select').trigger('change'); // ST loads the book into the editor
 }
 
 async function openNativeAt(name, uid) {
@@ -533,23 +740,11 @@ async function createWorldFile(name) {
 async function relinkWorldReferences(oldName, newName) {
     let touched = 0;
 
-    // Global selection (the #world_info select drives world_info.globalSelect)
-    const sel = jq('#world_info');
-    if (sel.length) {
-        const cur = sel.val() ?? [];
-        if (cur.includes(oldName)) {
-            if (![...sel[0].options].some((o) => o.value === newName)) {
-                sel.append(new Option(newName, newName));
-            }
-            sel.val(cur.map((v) => (v === oldName ? newName : v))).trigger('change');
-            touched++;
-        }
-    } else {
-        const wi = wiSettings();
-        if ((wi.globalSelect ?? []).includes(oldName)) {
-            wi.globalSelect = wi.globalSelect.map((v) => (v === oldName ? newName : v));
-            touched++;
-        }
+    // Global selection — canonical write via the WI module API
+    const curGlobal = globalActiveList();
+    if (curGlobal.includes(oldName)) {
+        await setGlobalActiveList(curGlobal.map((v) => (v === oldName ? newName : v)));
+        touched++;
     }
 
     // Character primary books
@@ -563,8 +758,9 @@ async function relinkWorldReferences(oldName, newName) {
         } catch (e) { console.warn(`[${MODULE_NAME}] character relink save failed`, e); }
     }
 
-    // Character additional books
-    for (const cl of wiSettings().charLore ?? []) {
+    // Character additional books (live settings object)
+    await loadWiModule();
+    for (const cl of wiLive()?.charLore ?? []) {
         if (Array.isArray(cl?.extraBooks) && cl.extraBooks.includes(oldName)) {
             cl.extraBooks = cl.extraBooks.map((b) => (b === oldName ? newName : b));
             touched++;
@@ -578,9 +774,10 @@ async function relinkWorldReferences(oldName, newName) {
     }
     if (pu.persona_description_lorebook === oldName) pu.persona_description_lorebook = newName;
 
-    // Current chat binding
-    if (ctx.chatMetadata?.world_info === oldName) {
-        ctx.chatMetadata.world_info = newName;
+    // Current chat binding (live metadata — see ctxNow)
+    const liveMeta = ctxNow().chatMetadata;
+    if (liveMeta?.world_info === oldName) {
+        liveMeta.world_info = newName;
         try { await ctx.saveMetadata(); } catch { /* non-fatal */ }
         jq('.chat_lorebook_button').addClass('world_set');
         touched++;
@@ -771,6 +968,7 @@ async function renameBook(oldName) {
     s.folderOrder[newName] = s.folderOrder[oldName] ?? []; delete s.folderOrder[oldName];
     s.collapsedFolders[newName] = s.collapsedFolders[oldName] ?? {}; delete s.collapsedFolders[oldName];
     s.lmImported[newName] = s.lmImported[oldName] ?? true; delete s.lmImported[oldName];
+    if (s.chatBindings[oldName]) { s.chatBindings[newName] = s.chatBindings[oldName]; delete s.chatBindings[oldName]; }
     saveSettings();
     invalidateBooks(oldName);
     invalidateBooks(newName);
@@ -802,6 +1000,7 @@ async function deleteBook(name) {
     delete s.collapsedFolders[name];
     delete s.lmImported[name];
     delete state.folderFilter[name];
+	delete s.chatBindings[name];
     saveSettings();
     invalidateBooks(name);
     if (state.bp?.name === name) await closeBookPopup(true);
@@ -811,19 +1010,28 @@ async function deleteBook(name) {
 }
 
 // ---------------------------------------------------------- binding actions
+// Re-renders every surface that shows bindings after an action changes them —
+// including the popup's Settings tab, whose rows are render-time snapshots.
+function refreshPopupBindingUi(name) {
+    renderGallery();
+    if (state.bp?.name === name) {
+        renderPopupHead();
+        if (state.bp.tab === 'settings') renderPopupSettingsPage();
+    }
+}
+
 async function assignPersona(avatarId, name, remove = false) {
     const pu = ctx.powerUserSettings;
     const d = pu.persona_descriptions[avatarId] ??= {
         description: '', position: 0, depth: 2, role: 0, lorebook: '', connections: [], title: '',
     };
     d.lorebook = remove ? '' : name;
-    const current = ctx.chatMetadata?.persona ?? pu.default_persona
+    const current = ctxNow().chatMetadata?.persona ?? pu.default_persona
         ?? (Object.keys(pu.personas ?? {}).length === 1 ? avatarId : null);
     if (current === avatarId) pu.persona_description_lorebook = d.lorebook;
     saveSettings();
     toast('success', remove ? 'Unbound from persona.' : 'Bound to persona.');
-    renderGallery();
-    if (state.bp?.name === name) renderPopupHead();
+    refreshPopupBindingUi(name);
 }
 
 async function assignCharacter(ch, name, kind, remove = false) {
@@ -834,54 +1042,47 @@ async function assignCharacter(ch, name, kind, remove = false) {
             else ctx.saveCharacterDebounced?.(ch);
         } catch (e) { console.warn(`[${MODULE_NAME}] character save failed`, e); }
     } else {
+        await loadWiModule();
+        const wiObj = wiLive();
+        if (!wiObj) { toast('error', 'World Info settings are unavailable on this build.'); return; }
         const key = String(ch.avatar).replace(/\.[^.]+$/, '');
-        const arr = (wiSettings().charLore ??= []);
+        const arr = (wiObj.charLore ??= []);
         let entry = arr.find((e) => e.name === key);
         if (!entry) { entry = { name: key, extraBooks: [] }; arr.push(entry); }
         entry.extraBooks ??= [];
         if (remove) entry.extraBooks = entry.extraBooks.filter((b) => b !== name);
         else if (!entry.extraBooks.includes(name)) entry.extraBooks.push(name);
-        saveSettings();
+        saveSettings(); // persists: script.js saves world_info_settings from the live object
     }
     toast('success', 'Character lore updated.');
-    renderGallery();
-    if (state.bp?.name === name) renderPopupHead();
+    refreshPopupBindingUi(name);
 }
 
 async function assignChat(name, remove = false) {
-    if (!ctx.chatId) { toast('warning', 'Open a chat first.'); return; }
-    if (remove) delete ctx.chatMetadata.world_info;
-    else ctx.chatMetadata.world_info = name;
-    await ctx.saveMetadata();
+    if (!chatOpen()) { toast('warning', 'Open a chat first.'); return; }
+    const meta = ctxNow().chatMetadata; // live object — writes reach the real chat file
+    if (remove) delete meta?.world_info;
+    else meta.world_info = name;
+    await ctx.saveMetadata(); // function reads live state internally — safe on the cached ctx
     jq('.chat_lorebook_button').toggleClass('world_set', !remove);
-    renderGallery();
-    if (state.bp?.name === name) renderPopupHead();
+    noteChatBindings(); // remember (or forget) this chat's link right away
+    refreshPopupBindingUi(name);
 }
 
-function setGlobalActive(name, active) {
-    const sel = jq('#world_info');
-    if (!sel.length) {
-        const wi = wiSettings();
-        wi.globalSelect = active
-            ? [...new Set([...(wi.globalSelect ?? []), name])]
-            : (wi.globalSelect ?? []).filter((x) => x !== name);
-        saveSettings();
-    } else {
-        if (![...sel[0].options].some((o) => o.value === name)) sel.append(new Option(name, name));
-        const cur = sel.val() ?? [];
-        const next = active ? [...new Set([...cur, name])] : cur.filter((x) => x !== name);
-        sel.val(next).trigger('change');
-    }
-    renderGallery();
-    if (state.bp?.name === name) renderPopupHead();
+async function setGlobalActive(name, active) {
+    const cur = globalActiveList();
+    const next = active
+        ? [...new Set([...cur, name])]
+        : cur.filter((x) => x !== name);
+    await setGlobalActiveList(next);
+    refreshPopupBindingUi(name);
 }
 
 function setType(name, t) {
     const s = getSettings();
     if (t) s.types[name] = t; else delete s.types[name];
     saveSettings();
-    renderGallery();
-    if (state.bp?.name === name) renderPopupHead();
+    refreshPopupBindingUi(name);
 }
 
 // ---------------------------------------------------------- floating menu
@@ -907,8 +1108,33 @@ function showMenu(items, anchor) {
             menu.appendChild(d);
             continue;
         }
+        if (it?.type === 'search') {
+            const box = document.createElement('input');
+            box.type = 'text';
+            box.className = 'text_pole wig-menu-search';
+            box.placeholder = it.placeholder ?? 'Filter…';
+            box.autocomplete = 'off';
+            const applyFilter = () => {
+                const q = box.value.trim().toLowerCase();
+                for (const r of menu.querySelectorAll('.wig-menu-item, .wig-menu-divider')) {
+                    if (r.classList.contains('wig-menu-divider')) { r.style.display = q ? 'none' : ''; continue; }
+                    if (!r.dataset.wigSearch) continue; // pinned rows stay visible
+                    r.style.display = (!q || r.dataset.wigSearch.includes(q)) ? '' : 'none';
+                }
+            };
+            box.addEventListener('input', applyFilter);
+            box.addEventListener('keydown', (ev) => {
+                ev.stopPropagation(); // typing must not close the menu
+                if (ev.key === 'Escape') { box.value = ''; applyFilter(); }
+            });
+            menu.appendChild(box);
+            setTimeout(() => box.focus(), 0);
+            continue;
+        }
         const row = document.createElement('div');
         row.className = 'wig-menu-item' + (it.danger ? ' danger' : '') + (it.disabled ? ' disabled' : '');
+        if (it.title) row.title = it.title;
+        if (!it.pinned) row.dataset.wigSearch = String(it.label ?? '').toLowerCase();
         if (it.img) {
             const im = document.createElement('img');
             im.className = 'wig-menu-img';
@@ -926,7 +1152,7 @@ function showMenu(items, anchor) {
         if (!it.disabled) row.addEventListener('click', () => { closeMenu(); it.action?.(row); });
         menu.appendChild(row);
     }
-    const host = menuHost();
+    const host = menuHost(anchor);
     host.appendChild(menu);
     wigMenu = menu;
 
@@ -940,23 +1166,43 @@ function showMenu(items, anchor) {
         y = (r.bottom ?? 0) + 4;
         if (y + mh > window.innerHeight - 8) y = Math.max(8, (r.top ?? 0) - mh - 4);
     } else {
-        // Host is an open <dialog>. Theme skins (Moonlit Echoes etc.) apply
-        // transform / backdrop-filter / zoom to .popup, which makes
-        // position:fixed resolve against the dialog's box instead of the
-        // viewport — viewport coords then land far off-target. Anchor
-        // absolutely to the dialog's on-screen box instead: the rect math is
-        // transform-proof because getBoundingClientRect() is post-transform.
+        // Host is an open <dialog> or the World Info panel. Theme skins
+        // (Moonlit Echoes) and PTMT transform their containers, which makes
+        // position:fixed resolve against the host's box instead of the
+        // viewport — so anchor absolutely to the host's on-screen box. The
+        // rect math is transform-proof (getBoundingClientRect() is
+        // post-transform) and stays correct under scrolling, since the host
+        // and the anchor move together.
         menu.style.position = 'absolute';
         const hr = host.getBoundingClientRect();
         const pad = 8;
-        x = (r.left ?? hr.left) - hr.left;
-        y = (r.bottom ?? 0) - hr.top + 4;
-        const maxX = hr.width - mw - pad;
-        const maxY = hr.height - mh - pad;
-        if (x > maxX) x = Math.max(pad, maxX);
-        if (x < pad) x = pad;
-        if (y + mh > hr.height - pad && maxY >= pad) y = Math.max(pad, (r.top ?? 0) - hr.top - mh - 4);
-        if (y < pad) y = pad;
+        // Visible region: the host's box clipped by its first scrolling
+        // ancestor (the drawer content scrolls on desktop) and by the
+        // viewport — keeps the menu on screen when the host is taller than
+        // the visible panel.
+        let vl = hr.left, vt = hr.top, vr = hr.right, vb = hr.bottom;
+        for (let p = host.parentElement; p && p !== document.documentElement; p = p.parentElement) {
+            if (['auto', 'scroll'].includes(getComputedStyle(p).overflowY)) {
+                const pr = p.getBoundingClientRect();
+                vl = Math.max(vl, pr.left); vt = Math.max(vt, pr.top);
+                vr = Math.min(vr, pr.right); vb = Math.min(vb, pr.bottom);
+                break;
+            }
+        }
+        vl = Math.max(vl, 0); vt = Math.max(vt, 0);
+        vr = Math.min(vr, window.innerWidth); vb = Math.min(vb, window.innerHeight);
+        // Desired viewport position, clamped into the visible region
+        let vx = r.left ?? hr.left;
+        let vy = (r.bottom ?? 0) + 4;
+        if (vy + mh > vb - pad) vy = Math.max(vt + pad, (r.top ?? 0) - mh - 4);
+        vx = Math.max(vl + pad, Math.min(vx, vr - mw - pad));
+        if (vy < vt + pad) vy = vt + pad;
+        // Viewport → host coordinates. When the host itself scrolls (mobile
+        // layouts give #world_popup overflow-y: auto), absolute children
+        // position in the scrolled content space.
+        const hostScrolls = ['auto', 'scroll'].includes(getComputedStyle(host).overflowY);
+        x = vx - hr.left + (hostScrolls ? host.scrollLeft : 0);
+        y = vy - hr.top + (hostScrolls ? host.scrollTop : 0);
     }
     menu.style.left = `${x}px`;
     menu.style.top = `${y}px`;
@@ -965,12 +1211,25 @@ function showMenu(items, anchor) {
     setTimeout(() => document.addEventListener('pointerdown', onOutsideMenu, { capture: true, once: true }), 0);
 }
 
-function menuHost() {
+function menuHost(anchor) {
     // Mirrors ST's getTopmostModalLayer(): popups are native <dialog> elements
     // in the browser's top layer, so nothing appended to <body> can render
     // above one. When a dialog is open, mount the menu inside it.
     const dialogs = $$('dialog[open]:not([closing])');
-    return dialogs.length ? dialogs[dialogs.length - 1] : document.body;
+    if (dialogs.length) return dialogs[dialogs.length - 1];
+    // Menus anchored inside the World Info panel mount INSIDE it. ST closes
+    // drawers on clicks "outside" them, and the check is DOM containment
+    // against a whitelist of selectors — '#world_popup' is one of them
+    // (script.js ~12105, alongside '.popup' and '.ui-widget'). A <body>-
+    // mounted menu matches nothing on that list however it's painted, so
+    // every click on it dismissed the WI drawer behind it (invisible under
+    // PTMT, whose tabs never auto-close). Inside #world_popup, the menu is
+    // part of the panel and the drawer stays open.
+    if (anchor instanceof Element) {
+        const wp = document.getElementById('world_popup');
+        if (wp?.contains(anchor)) return wp;
+    }
+    return document.body;
 }
 
 // ---------------------------------------------------------- card menus
@@ -986,8 +1245,9 @@ function cardMenu(name, anchor) {
         { type: 'divider' },
         { icon: 'fa-user', label: 'Link to persona…', action: () => menuAssignPersona(name, anchor) },
         { icon: 'fa-user-astronaut', label: 'Link to character…', action: () => menuAssignCharacter(name, anchor) },
-        { icon: 'fa-comments', label: 'Link to current chat', disabled: !ctx.chatId, action: () => assignChat(name) },
-        { icon: 'fa-unlink', label: 'Unlink from chat', disabled: !bindings.has('chat'), action: () => assignChat(name, true) },
+        { icon: 'fa-comments', label: 'Link to current chat', disabled: !chatOpen(), action: () => assignChat(name) },
+        { icon: 'fa-unlink', label: 'Unlink from current chat', disabled: !(chatOpen() && ctxNow().chatMetadata?.world_info === name), action: () => assignChat(name, true) },
+        { icon: 'fa-eraser', label: 'Forget chat links', disabled: !rememberedChatLinks(name).length, action: () => forgetChatBindings(name) },
         { icon: 'fa-globe', label: bindings.has('global') ? 'Remove from Global' : 'Add to Global', action: () => setGlobalActive(name, !bindings.has('global')) },
         { icon: 'fa-tag', label: 'Manual type label…', action: () => menuSetType(name, anchor) },
         { icon: 'fa-i-cursor', label: 'Rename…', action: () => renameBook(name) },
@@ -1009,6 +1269,7 @@ function menuAssignPersona(name, anchor) {
         img: safeThumb('persona', avatarId),
         action: () => assignPersona(avatarId, name),
     }));
+	if (personas.length > 12) items.unshift({ type: 'search', placeholder: 'Filter personas…' });
     items.push({ type: 'divider' });
     items.push({ icon: 'fa-xmark', label: 'Unbind from persona', danger: true, disabled: !bound, action: () => bound && assignPersona(bound, name, true) });
     showMenu(items, anchor);
@@ -1017,18 +1278,37 @@ function menuAssignPersona(name, anchor) {
 function menuAssignCharacter(name, anchor) {
     const chars = ctx.characters ?? [];
     if (!chars.length) { toast('warning', 'No characters found.'); return; }
-    showMenu(chars.slice(0, 300).map((ch) => ({
-        icon: ch === primaryCharFor(name) ? 'fa-check' : 'fa-user-astronaut',
-        label: ch.name,
-        img: safeThumb('avatar', ch.avatar),
-        action: () => menuCharacterActions(name, ch, anchor),
-    })), anchor);
+    const items = [];
+    // Pin the current chat's character at the top — the common case — so it
+    // never requires scrolling or searching the list.
+    const current = ctxNow().characters?.[ctxNow().characterId] ?? null;
+    if (current) {
+        items.push({
+            icon: current === primaryCharFor(name) ? 'fa-check' : 'fa-user-astronaut',
+            label: `Current: ${current.name}`,
+            img: safeThumb('avatar', current.avatar),
+            title: 'The character of the chat you have open',
+            pinned: true,
+            action: () => menuCharacterActions(name, current, anchor),
+        });
+        items.push({ type: 'divider' });
+    }
+    items.push({ type: 'search', placeholder: 'Filter characters…' });
+    for (const ch of chars.slice(0, 300)) {
+        items.push({
+            icon: ch === primaryCharFor(name) ? 'fa-check' : 'fa-user-astronaut',
+            label: ch.name,
+            img: safeThumb('avatar', ch.avatar),
+            action: () => menuCharacterActions(name, ch, anchor),
+        });
+    }
+    showMenu(items, anchor);
 }
 
 function menuCharacterActions(name, ch, anchor) {
     const key = String(ch.avatar).replace(/\.[^.]+$/, '');
     const isPrimary = ch?.data?.extensions?.world === name;
-    const isExtra = (wiSettings().charLore ?? []).some((e) => e.name === key && e.extraBooks?.includes(name));
+    const isExtra = (wiLive()?.charLore ?? []).some((e) => e.name === key && e.extraBooks?.includes(name));
     showMenu([
         { icon: 'fa-book-bookmark', label: 'Set as primary lorebook', disabled: isPrimary, action: () => assignCharacter(ch, name, 'primary') },
         { icon: 'fa-circle-plus', label: 'Add as additional lorebook', disabled: isExtra, action: () => assignCharacter(ch, name, 'extra') },
@@ -1058,7 +1338,7 @@ function addCoverIcon(cover) {
 function buildCard(c) {
     const el = document.createElement('div');
     el.className = 'wig-card';
-    el.title = c.name;
+    el.title = c.name + (c.chatLinks ? `\nChat-linked in ${c.chatLinks} chat${c.chatLinks === 1 ? '' : 's'}` : '');
 
     const cover = document.createElement('div');
     cover.className = 'wig-cover';
@@ -1133,8 +1413,9 @@ function buildNewCard() {
 function renderChips(cards) {
     const wrap = document.getElementById('wig-chips');
     if (!wrap) return;
-    const counts = { all: cards.length, unbound: 0, persona: 0, character: 0, chat: 0, global: 0 };
+    const counts = { all: cards.length, current: 0, unbound: 0, persona: 0, character: 0, chat: 0, global: 0 };
     for (const c of cards) {
+        if (c.current) counts.current++;
         if (!c.bindings.length && !c.manual) counts.unbound++;
         for (const b of c.bindings) if (counts[b] !== undefined) counts[b]++;
         if (c.manual && counts[c.manual] !== undefined && !c.bindings.includes(c.manual)) counts[c.manual]++;
@@ -1148,6 +1429,7 @@ function renderChips(cards) {
         const t = document.createElement('span');
         t.textContent = `${label} (${counts[key] ?? 0})`;
         chip.append(i, t);
+        if (key === 'current') chip.title = 'Active in the prompt right now: Global, current persona, current character, or current chat';
         chip.addEventListener('click', () => { state.filter = key; renderGallery(); });
         wrap.appendChild(chip);
     }
@@ -1174,6 +1456,8 @@ async function renderGallery() {
             manual: manualType(name),
             count: info.count,
             tokens: st?.done ? st.total : estTokensFromLength(info.chars),
+            chatLinks: rememberedChatLinks(name).length,
+            current: isCurrentlyActive(name, bindings),
         });
     }
 
@@ -1181,6 +1465,7 @@ async function renderGallery() {
     const list = cards.filter((c) =>
         (!q || c.name.toLowerCase().includes(q)) &&
         (state.filter === 'all' ? true :
+         state.filter === 'current' ? c.current :
          state.filter === 'unbound' ? (c.bindings.length === 0 && !c.manual) :
          (c.bindings.includes(state.filter) || c.manual === state.filter)));
 
@@ -2748,6 +3033,8 @@ function renderPopupSettingsPage() {
         return r;
     };
     const personaName = findPersonaByBook(name);
+    const chatLive = chatOpen() && ctxNow().chatMetadata?.world_info === name;
+    const chatN = rememberedChatLinks(name).length;
     secB.append(
         row('fa-globe', bindings.has('global') ? 'Active in Global World Info' : 'Not in Global World Info',
             bindings.has('global') ? 'Remove' : 'Add', () => setGlobalActive(name, !bindings.has('global'))),
@@ -2755,8 +3042,9 @@ function renderPopupSettingsPage() {
             'Manage…', (e) => menuAssignPersona(name, e.currentTarget)),
         row('fa-user-astronaut', primaryCharFor(name) ? `Primary book for: ${primaryCharFor(name).name}` : (extraCharsFor(name).length ? `Additional book for ${extraCharsFor(name).length} character(s)` : 'Not bound to any character'),
             'Manage…', (e) => menuAssignCharacter(name, e.currentTarget)),
-        row('fa-comments', bindings.has('chat') ? 'Bound to the current chat' : 'Not bound to the current chat',
-            bindings.has('chat') ? 'Unlink' : 'Link', () => assignChat(name, !bindings.has('chat'))),
+        row('fa-comments',
+            chatLive ? 'Bound to the current chat' : (chatN ? `Chat-linked in ${chatN} other chat${chatN === 1 ? '' : 's'}` : 'Not bound to any chat'),
+            chatLive ? 'Unlink' : 'Link', () => assignChat(name, chatLive)),
     );
 
     // Manual label
@@ -2935,7 +3223,7 @@ async function migrateRenames(names) {
     let dirty = false;
     if (added.length === 1 && removed.length === 1) {
         const [from, to] = [removed[0], added[0]];
-        for (const key of ['covers', 'types', 'folderOrder', 'lmImported']) {
+        for (const key of ['covers', 'types', 'folderOrder', 'lmImported', 'chatBindings']) {
             if (s[key]?.[from] !== undefined) {
                 if (s[key][to] === undefined) s[key][to] = s[key][from];
                 delete s[key][from];
@@ -2950,7 +3238,7 @@ async function migrateRenames(names) {
         if (state.folderFilter[from] !== undefined) { state.folderFilter[to] = state.folderFilter[from]; delete state.folderFilter[from]; }
     } else if (removed.length) {
         for (const n of removed) {
-            delete s.covers[n]; delete s.types[n]; delete s.folderOrder[n]; delete s.lmImported[n];
+            delete s.covers[n]; delete s.types[n]; delete s.folderOrder[n]; delete s.lmImported[n]; delete s.chatBindings[n];
             delete s.collapsedFolders[n]; delete state.folderFilter[n];
         }
         dirty = true;
@@ -2960,6 +3248,7 @@ async function migrateRenames(names) {
 
 // ---------------------------------------------------------- global reactions
 const onBooksChanged = debounce(async () => {
+    noteChatBindings(); // reconcile remembered chat links with the live chat
     const names = (await ctx.getWorldInfoNames()) ?? [];
     await migrateRenames(names);
     state.lastNames = names;
@@ -2988,7 +3277,15 @@ function wireGlobalListeners() {
         if (jq('#WorldInfo').is(':visible') && state.view !== 'gallery') setView('gallery');
     });
 
-    jq('#world_editor_select').on('change', async () => {
+    jq('#world_editor_select').on('change', async (e) => {
+        // React only to REAL user interaction with the selector. ST fires
+        // synthetic change events on it during normal operation —
+        // setWorldInfoSettings on init, reloadEditor after programmatic
+        // book/entry updates, and the editor refresh that follows a chat
+        // lorebook binding save. Treating those as user selections hijacked
+        // the gallery into the native editor view ("the UI closed").
+        // jQuery-synthesized events carry no originalEvent; user events do.
+        if (!e.originalEvent) return;
         await sleep(0);
         const v = jq('#world_editor_select').val();
         const hasBook = v !== '' && v !== null && v !== undefined;
@@ -3149,6 +3446,29 @@ async function initSettingsPanel() {
             if (state.bp) renderPopupHead();
         });
     }
+	    const scan = document.getElementById('wig-scan-chats');
+    if (scan) {
+        let scanning = false;
+        scan.addEventListener('click', async () => {
+            if (scanning) return;
+            scanning = true;
+            const label = scan.querySelector('span');
+            const old = label?.textContent ?? '';
+            scan.style.opacity = '0.5';
+            if (label) label.textContent = 'Scanning…';
+            try {
+                const { chats, books } = await scanAllChatBindings();
+                toast('success', `Scanned ${chats} chat${chats === 1 ? '' : 's'} — ${books} lorebook${books === 1 ? '' : 's'} chat-linked.`);
+            } catch (e) {
+                console.error(`[${MODULE_NAME}] chat scan failed`, e);
+                toast('error', 'Chat scan failed on this build.');
+            } finally {
+                scanning = false;
+                scan.style.opacity = '';
+                if (label) label.textContent = old;
+            }
+        });
+    }
 }
 
 // ---------------------------------------------------------- init
@@ -3163,8 +3483,10 @@ async function init() {
     injectFolderBar();
     wireGlobalListeners();
     state.lastNames = (await ctx.getWorldInfoNames()) ?? [];
-	cfSupportsArrayModel(); // settle character-filter capability before first editor opens
+    cfSupportsArrayModel(); // settle character-filter capability before first editor opens
     loadTags();             // prewarm the tags registry
+    await loadWiModule();   // live WI settings (charLore / selected_world_info) for badges
+    noteChatBindings();     // seed remembered chat links from the restored chat
     setView(getSettings().galleryDefault ? 'gallery' : 'editor');
     console.debug(`[${MODULE_NAME}] initialized`);
 }
