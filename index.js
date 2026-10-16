@@ -1564,8 +1564,8 @@ async function makeNewEntry(data) {
     entry.displayIndex ??= nextDisplay;
     entry.comment = 'New Entry';
 	//My Local preference only
-    //entry.excludeRecursion = true;
-    //entry.preventRecursion = true;
+    entry.excludeRecursion = true;
+    entry.preventRecursion = true;
     return entry;
 }
 
