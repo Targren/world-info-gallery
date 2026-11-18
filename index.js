@@ -1939,34 +1939,37 @@ function applyDraftToEntry(entry, v) {
 	}
 }
 
-
-// Bulk save all dirty drafts in the open book popup
-async function saveAllDrafts(bp) {
-    if (!bp?.drafts?.size) return true;
-    const book = bp.name;
+// Saves every entry with unsaved edits in one book write. Drafts are
+// stashed continuously as the user types (bp.stash), so this applies them
+// all — including edits sitting in collapsed rows — with a single server
+// save, instead of visiting each editor's Save button.
+async function saveAllDrafts(book) {
+    const bp = state.bp;
+    if (!bp) return;
+    if (!bp.stash?.size) { toast('info', 'No unsaved edits.'); return; }
     const data = await ctx.loadWorldInfo(book);
-    if (!data?.entries) return false;
-
-    for (const uid of bp.drafts) {
+    if (!data?.entries) { toast('error', 'Could not read the lorebook.'); return; }
+    let saved = 0;
+    const unnamedOutlets = [];
+    for (const [uid, v] of bp.stash) {
         const entry = data.entries[uid];
-        if (!entry) continue;
-
-        // Prefer live editor if that row is still open; else last stash
-        const row = bp.dlg?.content?.querySelector(`.wig-bp-entry[data-uid="${uid}"]`);
-        const ed = row?.querySelector('.wig-bp-editor') ?? row; // whatever the editor root is
-        const map = ed?.querySelector?.('[data-wig-field]')
-            ? harvestDraft(ed)
-            : bp.stash.get(uid);
-        if (!map) continue;
-
-        applyDraftToEntry(entry, map);
+        if (!entry) { bp.drafts.delete(uid); bp.stash.delete(uid); continue; } // deleted elsewhere — drop the stale draft
+        applyDraftToEntry(entry, v);
+        if (entry.position === 7 && !entry.outletName) unnamedOutlets.push(uid);
+        saved++;
     }
-
-    await ctx.saveWorldInfo(book, data);
+    if (!saved) { toast('info', 'No unsaved edits.'); return; }
+    await ctx.saveWorldInfo(book, data);   // one write for the whole book
+    invalidateBooks(book);
     bp.drafts.clear();
     bp.stash.clear();
-    invalidateBooks(book);
-    return true;
+    $$('[data-wig-draft]', bp.dlg?.content ?? document).forEach((el) => el.removeAttribute('data-wig-draft'));
+    renderGallery();
+    toast('success', `Saved ${saved} ${saved === 1 ? 'entry' : 'entries'}.`);
+    if (unnamedOutlets.length) {
+        toast('warning', `${unnamedOutlets.length} outlet ${unnamedOutlets.length === 1 ? 'entry has' : 'entries have'} no name — ${unnamedOutlets.length === 1 ? 'it will be' : 'they will be'} skipped at generation.`);
+    }
+    await bp.rerender?.();
 }
 
 function renderPopupHead() {
