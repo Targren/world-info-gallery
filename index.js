@@ -1876,67 +1876,72 @@ async function openBookPopup(name) {
     renderPopupHead();
     renderPopupEntriesPage();
 }
+// Applies a harvested draft map ({ field: value }) to a book entry object.
+// Single source of truth for draft→entry serialization, shared by the Save
+// button (harvests the live editor) and Save All (applies stashed drafts).
+// Mirrors the coercions Save has always used.
+function applyDraftToEntry(entry, v) {
+	function characterFilterFromDraft(raw) {
+		try {
+			const v = JSON.parse(raw || 'null');
+			if (!v || typeof v !== 'object') return null;
+			const norm = {
+				characters: new Map(v.characters ?? []),
+				tags: new Map(v.tags ?? []),
+				personas: new Map(v.personas ?? []),
+			};
+			if (!norm.characters.size && !norm.tags.size && !norm.personas.size) return null;
+			const format = v.format ?? (cfApiCache === true ? 'array' : 'object');
+			return writeCharacterFilter(format, norm);
+		} catch {
+			return undefined; // leave entry.characterFilter alone
+		}
+	}
+	const triValue = (sel) => (sel.value === '' ? null : sel.value === '1');
+	if ('comment' in v) entry.comment = String(v.comment ?? '').slice(0, 100);
+	if ('key' in v) entry.key = parseKeys(v.key);
+	if ('keysecondary' in v) entry.keysecondary = parseKeys(v.keysecondary);
+	if ('selectiveLogic' in v) entry.selectiveLogic = Number(v.selectiveLogic) || 0;
+	if ('content' in v) entry.content = v.content ?? '';
+	if ('position' in v) entry.position = Number(v.position) || 0;
+	if ('order' in v) entry.order = Number(v.order) || 0;
+	if ('depth' in v) entry.depth = Math.max(0, Number(v.depth) || 0);
+	if ('role' in v) entry.role = Number(v.role) || 0;
+	if ('constant' in v) entry.constant = !!v.constant;
+	if ('vectorized' in v) entry.vectorized = !!v.vectorized;
+	if ('caseSensitive' in v) entry.caseSensitive = triValue(v.caseSensitive);
+	if ('matchWholeWords' in v) entry.matchWholeWords = triValue(v.matchWholeWords);
+	if ('scanDepth' in v) entry.scanDepth = v.scanDepth === '' || v.scanDepth == null
+		? null : Math.max(0, Number(v.scanDepth) || 0);
+	if ('outletName' in v) entry.outletName = String(v.outletName ?? '').trim();
+	if ('useProbability' in v) entry.useProbability = !!v.useProbability;
+	if ('probability' in v) entry.probability = Math.min(100, Math.max(0, Number(v.probability) || 0));
+	if ('group' in v) entry.group = String(v.group ?? '').trim();
+	if ('groupOverride' in v) entry.groupOverride = !!v.groupOverride;
+	if ('groupWeight' in v) entry.groupWeight = Math.min(100, Math.max(1, Number(v.groupWeight) || 100));
+	if ('useGroupScoring' in v) entry.useGroupScoring = triValue(v.useGroupScoring);
+	if ('sticky' in v) entry.sticky = Math.max(0, Number(v.sticky) || 0);
+	if ('cooldown' in v) entry.cooldown = Math.max(0, Number(v.cooldown) || 0);
+	if ('delay' in v) entry.delay = Math.max(0, Number(v.delay) || 0);
+	if ('preventRecursion' in v) entry.preventRecursion = !!v.preventRecursion;
+	if ('excludeRecursion' in v) entry.excludeRecursion = !!v.excludeRecursion;
+	if ('delayUntilRecursion' in v) entry.delayUntilRecursion = !!v.delayUntilRecursion;
+	if ('addMemo' in v) entry.addMemo = !!v.addMemo;
+	if ('automationId' in v) entry.automationId = String(v.automationId ?? '').trim();
+	// source_* and characterFilter need the same helpers Save already uses
+	for (const k of Object.keys(v)) {
+		if (k.startsWith('src_')) entry[k.slice(4)] = !!v[k];
+	}
+	if ('characterFilter' in v) {
+		const cf = characterFilterFromDraft(v.characterFilter);
+		if (cf === null) delete entry.characterFilter;
+		else if (cf !== undefined) entry.characterFilter = cf;
+	}
+}
+
 
 // Bulk save all dirty drafts in the open book popup
 async function saveAllDrafts(bp) {
-    function applyDraftToEntry(entry, v) {
-        function characterFilterFromDraft(raw) {
-            try {
-                const v = JSON.parse(raw || 'null');
-                if (!v || typeof v !== 'object') return null;
-                const norm = {
-                    characters: new Map(v.characters ?? []),
-                    tags: new Map(v.tags ?? []),
-                    personas: new Map(v.personas ?? []),
-                };
-                if (!norm.characters.size && !norm.tags.size && !norm.personas.size) return null;
-                const format = v.format ?? (cfApiCache === true ? 'array' : 'object');
-                return writeCharacterFilter(format, norm);
-            } catch {
-                return undefined; // leave entry.characterFilter alone
-            }
-        }
-        const triValue = (sel) => (sel.value === '' ? null : sel.value === '1');
-        if ('comment' in v) entry.comment = String(v.comment ?? '').slice(0, 100);
-        if ('key' in v) entry.key = parseKeys(v.key);
-        if ('keysecondary' in v) entry.keysecondary = parseKeys(v.keysecondary);
-        if ('selectiveLogic' in v) entry.selectiveLogic = Number(v.selectiveLogic) || 0;
-        if ('content' in v) entry.content = v.content ?? '';
-        if ('position' in v) entry.position = Number(v.position) || 0;
-        if ('order' in v) entry.order = Number(v.order) || 0;
-        if ('depth' in v) entry.depth = Math.max(0, Number(v.depth) || 0);
-        if ('role' in v) entry.role = Number(v.role) || 0;
-        if ('constant' in v) entry.constant = !!v.constant;
-        if ('vectorized' in v) entry.vectorized = !!v.vectorized;
-        if ('caseSensitive' in v) entry.caseSensitive = triValue(v.caseSensitive);
-        if ('matchWholeWords' in v) entry.matchWholeWords = triValue(v.matchWholeWords);
-        if ('scanDepth' in v) entry.scanDepth = v.scanDepth === '' || v.scanDepth == null
-            ? null : Math.max(0, Number(v.scanDepth) || 0);
-        if ('outletName' in v) entry.outletName = String(v.outletName ?? '').trim();
-        if ('useProbability' in v) entry.useProbability = !!v.useProbability;
-        if ('probability' in v) entry.probability = Math.min(100, Math.max(0, Number(v.probability) || 0));
-        if ('group' in v) entry.group = String(v.group ?? '').trim();
-        if ('groupOverride' in v) entry.groupOverride = !!v.groupOverride;
-        if ('groupWeight' in v) entry.groupWeight = Math.min(100, Math.max(1, Number(v.groupWeight) || 100));
-        if ('useGroupScoring' in v) entry.useGroupScoring = triValue(v.useGroupScoring);
-        if ('sticky' in v) entry.sticky = Math.max(0, Number(v.sticky) || 0);
-        if ('cooldown' in v) entry.cooldown = Math.max(0, Number(v.cooldown) || 0);
-        if ('delay' in v) entry.delay = Math.max(0, Number(v.delay) || 0);
-        if ('preventRecursion' in v) entry.preventRecursion = !!v.preventRecursion;
-        if ('excludeRecursion' in v) entry.excludeRecursion = !!v.excludeRecursion;
-        if ('delayUntilRecursion' in v) entry.delayUntilRecursion = !!v.delayUntilRecursion;
-        if ('addMemo' in v) entry.addMemo = !!v.addMemo;
-        if ('automationId' in v) entry.automationId = String(v.automationId ?? '').trim();
-        // source_* and characterFilter need the same helpers Save already uses
-        for (const k of Object.keys(v)) {
-            if (k.startsWith('src_')) entry[k.slice(4)] = !!v[k];
-        }
-        if ('characterFilter' in v) {
-            const cf = characterFilterFromDraft(v.characterFilter);
-            if (cf === null) delete entry.characterFilter;
-            else if (cf !== undefined) entry.characterFilter = cf;
-        }
-    }
     if (!bp?.drafts?.size) return true;
     const book = bp.name;
     const data = await ctx.loadWorldInfo(book);
