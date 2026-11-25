@@ -84,7 +84,7 @@ function isAuxAnywhere(name) {
     return false;
 }
 
-// migrate trueGlobals from the live global list the first time the feature runs. 
+// migrate trueGlobals from the live global list the first time the feature runs.
 function migrateTrueGlobalsIfNeeded() {
     const s = getSettings();
     if (s.trueGlobals !== null) return;
@@ -92,7 +92,7 @@ function migrateTrueGlobalsIfNeeded() {
     saveSettings();
 }
 
-// Desired global list = extension-owned true globals ∪ aux books for the current chat. 
+// Desired global list = extension-owned true globals ∪ aux books for the current chat.
 async function applyChatAuxGlobals() {
     migrateTrueGlobalsIfNeeded();
     const s = getSettings();
@@ -212,7 +212,7 @@ const DEFAULTS = Object.freeze({
     lmImported: {},        // worldName -> true (auto Lorebook Manager import done)
     chatBindings: {},      // worldName -> [{ o: ownerKey, f: chatFile }] remembered chat links
     lastChatScan: 0,       // timestamp of the last "Scan all chats" run
-    // Chat-aux lorebooks: extra books promoted into the global active list only while their chat is open. trueGlobals is extension-owned;    
+    // Chat-aux lorebooks: extra books promoted into the global active list only while their chat is open. trueGlobals is extension-owned;
     trueGlobals: null,     // string[] | null - null indicates migration not done
     chatAux: {},           // chatKey -> string[] of book names
 });
@@ -690,16 +690,30 @@ function coverFor(name, bindings) {
             const id = findPersonaByBook(name);
             if (id) return { url: safeThumb('persona', id) };
         }
-        // Chat-bound book: derive from the character that OWNS the binding
-        // chat — the remembered link's owner — not the current chat's
-        // character, so the cover stays stable when chats are switched or
-        // closed. Live binding → current chat's owner; otherwise the first
-        // remembered link. Group-owned chats have no single character and
-        // fall through to the placeholder.
-        if (bindings.has('chat')) {
-            const live = ctxNow();
-            const boundHere = live.chatMetadata?.world_info === name;
-            const owner = boundHere ? chatOwnerKey() : rememberedChatLinks(name)[0]?.o;
+        // Chat-bound or chat-aux book: derive from the character that OWNS
+        // the binding chat — not the current chat's character — so the cover
+        // stays stable when chats are switched or closed.
+        // Native chat: live binding → current owner; else first remembered link.
+        // Chat-aux ('chat+'): current chat if this book is aux there; else the
+        // first chatAux registration. Group-owned chats fall through.
+        if (bindings.has('chat') || bindings.has('chat+')) {
+            let owner = null;
+            if (bindings.has('chat')) {
+                const live = ctxNow();
+                const boundHere = live.chatMetadata?.world_info === name;
+                owner = boundHere ? chatOwnerKey() : rememberedChatLinks(name)[0]?.o;
+            }
+            if (!owner && bindings.has('chat+')) {
+                if (isAuxForCurrentChat(name)) owner = chatOwnerKey();
+                else {
+                    for (const [key, arr] of Object.entries(getSettings().chatAux ?? {})) {
+                        if (Array.isArray(arr) && arr.includes(name)) {
+                            owner = key.split('::')[0] || null;
+                            break;
+                        }
+                    }
+                }
+            }
             const ch = owner && !String(owner).startsWith('group:')
                 ? (ctx.characters ?? []).find((c) => c.avatar === owner)
                 : null;
@@ -1503,6 +1517,17 @@ function buildCard(c) {
     const title = document.createElement('div');
     title.className = 'wig-title';
     title.textContent = c.name;
+    // Mobile has no hover tooltip; long names are CSS-clamped. Tap the title
+    // to expand/collapse the full string without opening the book.
+    if (String(c.name).length > 24) {
+        title.classList.add('wig-title-trunc');
+        title.title = 'Tap to show full name';
+        title.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const open = title.classList.toggle('expanded');
+            title.title = open ? 'Tap to shorten' : 'Tap to show full name';
+        });
+    }
 
     const meta = document.createElement('div');
     meta.className = 'wig-meta';
